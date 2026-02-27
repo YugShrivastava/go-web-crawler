@@ -224,9 +224,10 @@ func main() {
 	for queue.size() > 0 && crawled.size() < 5000 {
 		url := queue.dequeue()
 		crawled.add(url)
-
+		now := time.Now()
 		go fetchPage(url, c)
 		content := <- c
+		fmt.Println("Time passed: ", time.Since(now))
 		if len(content) == 0 {
 			continue
 		}
