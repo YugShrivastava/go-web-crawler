@@ -1,261 +1,238 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/joho/godotenv"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/net/html"
 )
-type Queue struct {
-	totalQueued int
-	number int
-	elements []string
+
+const (
+	numWorkers   = 1000
+	maxVisits    = 5000
+	requestDelay = 300 * time.Millisecond
+)
+
+// -----------------------------
+// Crawler State
+// -----------------------------
+
+type Visited struct {
 	mu sync.Mutex
+	m  map[string]struct{}
 }
-func (q *Queue) enqueue(url string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.elements = append(q.elements, url)
-	q.totalQueued++
-	q.number++
-}
-func (q *Queue) dequeue() string {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	url := q.elements[0]
-	q.elements = q.elements[1:]
-	q.number--
-	return url
-}
-func (q *Queue) size() int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.number
-}
-type CrawledSet struct {
-	data map[uint64]bool
-	number int
-	mu sync.Mutex
-}
-func (c *CrawledSet) add(url string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.data[hashUrl(url)] = true
-	c.number++
-}
-func (c *CrawledSet) contains(url string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.data[hashUrl(url)]
-}
-func (c *CrawledSet) size() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.number
-}
-func hashUrl(url string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(url))
-	return h.Sum64()
-}
-func getHref(t html.Token) (ok bool, href string) {
-    for _, a := range t.Attr {
-        if a.Key == "href" {
-			if len(a.Val) == 0 || !strings.HasPrefix(a.Val, "http") {
-				ok = false
-	            href = a.Val
-				return ok, href
-			}
-            href = a.Val
-			ok = true
-        }
-    }
-    return ok, href
-}
-func fetchPage(url string, c chan []byte)  { 
-	res, err := http.Get(url)
-	if err != nil {
-		body := []byte("")
-		c <- body
-		return
+
+func NewVisited() *Visited {
+	return &Visited{
+		m: make(map[string]struct{}),
 	}
-	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		body = []byte("")
-	}
-	c <- body
 }
-func parseHTML(currUrl string, content []byte, q *Queue, crawled *CrawledSet, db *DatabaseConnection) {
-	z := html.NewTokenizer(bytes.NewReader(content))
-	tokenCount := 0
-	pageContentLength := 0
-	body := false
-	webpage := Webpage{Url: currUrl, Title: "", Content: ""}
+
+func (v *Visited) Add(u string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if _, exists := v.m[u]; exists {
+		return false
+	}
+	v.m[u] = struct{}{}
+	return true
+}
+
+func (v *Visited) Count() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.m)
+}
+
+// -----------------------------
+// Worker
+// -----------------------------
+
+func worker(
+	ctx context.Context,
+	id int,
+	jobs <-chan string,
+	discovered chan<- string,
+	wg *sync.WaitGroup,
+	visited *Visited,
+) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
 	for {
-		if z.Next() == html.ErrorToken || tokenCount > 500 {
-			if crawled.size() < 1000 {
-				db.insertWebpage(webpage)
-			}
+		select {
+		case <-ctx.Done():
 			return
-		}
-		t := z.Token()
-		if t.Type == html.StartTagToken {
-			if t.Data == "body" {
-				body = true
+
+		case u, ok := <-jobs:
+			if !ok {
+				return
 			}
-			if t.Data == "javascript" || t.Data == "script" || t.Data == "style" {
-				// Skip script and style tags
-				z.Next()
+
+			fmt.Println("Worker", id, "crawling:", u)
+
+			links, err := fetchAndParse(client, u)
+			if err != nil {
+				fmt.Println("Worker", id, "error:", err)
+				wg.Done()
 				continue
 			}
-			if t.Data == "title" {
-				z.Next()
-				title := z.Token().Data // data disappears after z.Token() is called
-				webpage.Title = title
-				fmt.Printf("Count: %d | %s -> %s\n", crawled.size(), currUrl, title)
-			}
-			if t.Data == "a" {
-				ok, href := getHref(t)
-				if !ok {
-					continue
+
+			time.Sleep(requestDelay)
+
+			for _, link := range links {
+				if visited.Count() >= maxVisits {
+					break
 				}
-				if crawled.contains(href) {
-					// Already crawled
-					continue
-				} else {
-					q.enqueue(href)
+
+				if visited.Add(link) {
+					wg.Add(1)
+					select {
+					case discovered <- link:
+					case <-ctx.Done():
+						break
+					}
+				}
+			}
+
+			wg.Done()
+		}
+	}
+}
+
+// -----------------------------
+// Dispatcher (kept per architecture)
+// -----------------------------
+
+func dispatcher(
+	ctx context.Context,
+	discovered <-chan string,
+	jobs chan<- string,
+) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case u, ok := <-discovered:
+			if !ok {
+				return
+			}
+			// Block naturally instead of busy waiting
+			jobs <- u
+		}
+	}
+}
+
+// -----------------------------
+// Fetch + Parse
+// -----------------------------
+
+func fetchAndParse(client *http.Client, rawURL string) ([]string, error) {
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	return parseLinks(body, rawURL), nil
+}
+
+func parseLinks(body []byte, base string) []string {
+	doc, err := html.Parse(strings.NewReader(string(body)))
+	if err != nil {
+		return nil
+	}
+
+	baseURL, err := url.Parse(base)
+	if err != nil {
+		return nil
+	}
+
+	var links []string
+
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					href := strings.TrimSpace(attr.Val)
+					parsed, err := url.Parse(href)
+					if err != nil {
+						continue
+					}
+					abs := baseURL.ResolveReference(parsed)
+					if abs.Scheme == "http" || abs.Scheme == "https" {
+						links = append(links, abs.String())
+					}
 				}
 			}
 		}
-		if body && t.Type == html.TextToken && pageContentLength < 500 {
-			webpage.Content += strings.TrimSpace(t.Data)
-			pageContentLength += len(t.Data)
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
 		}
-		tokenCount++
 	}
+
+	f(doc)
+	return links
 }
-type DatabaseConnection struct {
-	access bool
-	uri string
-	client *mongo.Client
-	collection *mongo.Collection
-}
-func (d *DatabaseConnection) connect() {
-	if d.access {
-		// Connect to database
-		d.uri = os.Getenv("MONGO_URI")
-		client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(d.uri))
-		if err != nil {
-			panic(err)
-		}
-		d.client = client
-		d.collection = d.client.Database("webCrawlerArchive").Collection("webpages")
-		filter := bson.D{{}}
-		// Deletes all documents in the collection
-		d.collection.DeleteMany(context.TODO(), filter)
-	}
-}
-func (d *DatabaseConnection) disconnect() {
-	if d.access {
-		d.client.Disconnect(context.TODO())
-	}
-}
-func (d *DatabaseConnection) insertWebpage(webpage Webpage) {
-	if d.access {
-		d.collection.InsertOne(context.TODO(), webpage)
-	}
-}
-type Webpage struct {
-	Url string
-	Title string
-	Content string
-}
+
+// -----------------------------
+// Main
+// -----------------------------
+
 func main() {
-	webArchiveAccess := true
-	if godotenv.Load() != nil {
-		fmt.Println("Error loading .env file. No access to web archive.")
-		webArchiveAccess = false
+	start := "https://crawler-test.com/"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	jobs := make(chan string, numWorkers)
+	discovered := make(chan string, 1000)
+
+	var wg sync.WaitGroup
+	visited := NewVisited()
+
+	// Start workers
+	for i := range(numWorkers) {
+		go worker(ctx, i, jobs, discovered, &wg, visited)
 	}
-	db := DatabaseConnection{access: webArchiveAccess, uri: "", client: nil, collection: nil}
-	db.connect()
 
-	crawled := CrawledSet{data: make(map[uint64]bool)}
-	seed := "https://www.cc.gatech.edu/"
-	queue := Queue{totalQueued: 0, number: 0, elements: make([]string, 0)}
+	// Start dispatcher
+	go dispatcher(ctx, discovered, jobs)
 
-	ticker := time.NewTicker(1 * time.Minute)
-	done := make(chan bool)
-	crawlerStats := CrawlerStats{pagesPerMinute: "0 0\n", crawledRatioPerMinute: "0 0\n", startTime: time.Now()}
-	
-	// Tick every minute
+	// Seed
+	visited.Add(start)
+	wg.Add(1)
+	discovered <- start
+
+	// Shutdown controller
 	go func() {
-		for {
-            select {
-            case <-done:
-                return
-            case t := <-ticker.C:
-                crawlerStats.update(&crawled, &queue, t)
-            }
-        }
+		wg.Wait()
+		cancel()
+		close(discovered)
+		close(jobs)
 	}()
-	queue.enqueue(seed)
-	url := queue.dequeue()
-	crawled.add(url)
-	c := make(chan []byte)
 
-	go fetchPage(url, c)
-	
-	content := <- c
-	parseHTML(url, content, &queue, &crawled, &db)
+	wg.Wait()
 
-	for queue.size() > 0 && crawled.size() < 5000 {
-		url := queue.dequeue()
-		crawled.add(url)
-		now := time.Now()
-		go fetchPage(url, c)
-		content := <- c
-		fmt.Println("Time passed: ", time.Since(now))
-		if len(content) == 0 {
-			continue
-		}
-		go parseHTML(url, content, &queue, &crawled, &db)
-	}
-	ticker.Stop()
-    done <- true
-	db.disconnect()
-	fmt.Println("\n------------------CRAWLER STATS------------------")
-	fmt.Printf("Total queued: %d\n", queue.totalQueued)
-	fmt.Printf("To be crawled (Queue) size: %d\n", queue.size())
-	fmt.Printf("Crawled size: %d\n", crawled.size())
-	crawlerStats.print()
-}
-
-type CrawlerStats struct {
-	pagesPerMinute string // 0 0 \n 1 100
-	crawledRatioPerMinute string 
-	startTime time.Time
-}
-
-func (c *CrawlerStats) update(crawled *CrawledSet, queue *Queue, t time.Time) {
-	c.pagesPerMinute += fmt.Sprintf("%f %d\n", t.Sub(c.startTime).Minutes(), crawled.size())
-	c.crawledRatioPerMinute += fmt.Sprintf("%f %f\n", t.Sub(c.startTime).Minutes(), float64(crawled.size())/float64(queue.size()))
-}
-func (c *CrawlerStats) print() {
-	fmt.Println("Pages crawled per minute:")
-	fmt.Println(c.pagesPerMinute)
-	fmt.Println("Crawl to Queued Ratio per minute:")
-	fmt.Println(c.crawledRatioPerMinute)
+	fmt.Println("Crawling complete")
+	fmt.Println("Total visited:", visited.Count())
 }
