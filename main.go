@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	numWorkers   = 500
+	numWorkers   = 100
 	maxVisits    = 5000
 	requestDelay = 300 * time.Millisecond
 )
@@ -205,7 +205,7 @@ func main() {
 	defer cancel()
 
 	jobs := make(chan string, numWorkers)
-	discovered := make(chan string, 1000)
+	discovered := make(chan string, numWorkers * 1000)
 
 	var wg sync.WaitGroup
 	visited := NewVisited()
