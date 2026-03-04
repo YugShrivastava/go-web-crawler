@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	numWorkers   = 1000
+	numWorkers   = 500
 	maxVisits    = 5000
 	requestDelay = 300 * time.Millisecond
 )
@@ -219,6 +219,7 @@ func main() {
 	go dispatcher(ctx, discovered, jobs)
 
 	// Seed
+	now := time.Now()
 	visited.Add(start)
 	wg.Add(1)
 	discovered <- start
@@ -235,4 +236,5 @@ func main() {
 
 	fmt.Println("Crawling complete")
 	fmt.Println("Total visited:", visited.Count())
+	fmt.Println("Total time taken: ", time.Since(now))
 }
